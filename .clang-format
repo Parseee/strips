@@ -1,0 +1,6 @@
+BasedOnStyle: LLVM
+
+AccessModifierOffset: -2
+AlignAfterOpenBracket: Align
+ColumnLimit: 80
+IndentWidth: 4
