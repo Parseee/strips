@@ -6,16 +6,16 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # add elfutils
 # Manually specify elfutils include directory
-# find_path(ELFUTILS_INCLUDE_DIR NAMES libelf.h PATHS /usr/include /usr/local/include)
-# if(NOT ELFUTILS_INCLUDE_DIR)
-#     message(FATAL_ERROR "elfutils include directory not found!")
-# endif()
+find_path(ELFUTILS_INCLUDE_DIR NAMES libelf.h PATHS /usr/include /usr/local/include)
+if(NOT ELFUTILS_INCLUDE_DIR)
+    message(FATAL_ERROR "elfutils include directory not found!")
+endif()
 
-# # Manually specify elfutils library directory
-# find_library(ELFUTILS_LIBRARY NAMES elf PATHS /usr/lib /usr/local/lib)
-# if(NOT ELFUTILS_LIBRARY)
-#     message(FATAL_ERROR "elfutils library not found!")
-# endif()
+# Manually specify elfutils library directory
+find_library(ELFUTILS_LIBRARY NAMES elf PATHS /usr/lib /usr/local/lib)
+if(NOT ELFUTILS_LIBRARY)
+    message(FATAL_ERROR "elfutils library not found!")
+endif()
 
 # Source files
 set(SOURCES

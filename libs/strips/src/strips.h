@@ -19,9 +19,10 @@
         }                                                                      \
     } while (0)
 
-#define ERROR(err_msg)                                                         \
+#define ERROR(err_msg, ...)                                                    \
     do {                                                                       \
         fprintf(stderr, err_msg "\n");                                         \
+        __VA_ARGS__;                                                           \
         exit(EXIT_FAILURE);                                                    \
     } while (0)
 

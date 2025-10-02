@@ -1,4 +1,4 @@
-// #include <libelf.h>
+#include <libelf.h>
 
 #include "strips.h"
 
@@ -23,4 +23,8 @@ bool elf_check_magic(Elf32_Ehdr *hdr) {
         return false;
     }
     return true;
+}
+
+void load_elf_file() {
+    
 }
