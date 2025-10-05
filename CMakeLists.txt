@@ -23,7 +23,7 @@ set(DEPS
     
 add_executable(${PROJECT_NAME} ${MAIN_SOURCES})
 # add target_link_options
-target_link_libraries(${PROJECT_NAME} PRIVATE project_compiler_options 
+target_link_libraries(${PROJECT_NAME} PUBLIC project_compiler_options 
     $<$<CONFIG:Debug>:-fsanitize=address,leak>  
     $<$<CONFIG:Release>:-O2>
     ${DEPS})

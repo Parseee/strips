@@ -21,6 +21,7 @@ endif()
 set(SOURCES
     src/strips.c
     src/strips.h
+    lib_strips.h
     )
 
 # Create library

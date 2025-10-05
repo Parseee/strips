@@ -19,13 +19,30 @@
         }                                                                      \
     } while (0)
 
-#define ERROR(err_msg, ...)                                                    \
+#define ERROR(msg, ...)                                                        \
     do {                                                                       \
-        fprintf(stderr, err_msg "\n");                                         \
+        fprintf(stderr, msg);                                                  \
         __VA_ARGS__;                                                           \
-        exit(EXIT_FAILURE);                                                    \
+        return STRIPS_FAILURE;                                                 \
     } while (0)
 
-typedef enum { STRIPS_OK, STRIPS_FAILURE } STRIPS_ERROR;
+typedef enum {
+    STRIPS_OK,
+    STRIPS_FAILURE,
+    STRIPS_EHDR_FAILURE,
+    STRIPS_SHDR_FAILURE,
+    STRIPS_PHNUM_FAILURE,
+    STRIPS_PHDR_FAILURE
+} STRIPS_ERROR;
 
-bool elf_check_magic(Elf32_Ehdr *hdr);
+typedef struct {
+    bool symtab;
+    bool debug;
+} strip_policy_t;
+
+bool strips_check_magic(Elf32_Ehdr *hdr);
+
+STRIPS_ERROR strips_process_file(const char *filename,
+                                 const strip_policy_t policy);
+
+const char *strips_strerror(const STRIPS_ERROR error);
