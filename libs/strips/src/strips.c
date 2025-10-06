@@ -13,6 +13,7 @@
 #include "strips.h"
 
 #define MAX_FILENAME_LEN 256
+#define MANUAL_PROGRAM_HEADER_UPDATE
 
 static bool strips_should_strip(const char *name, GElf_Shdr *sec_head,
                                 const strip_policy_t policy) {
@@ -50,23 +51,25 @@ static STRIPS_ERROR strips_update_headers(Elf *in_elf, Elf *out_elf) {
         return STRIPS_EHDR_FAILURE;
     }
 
-    // size_t phnum;
-    // if ((elf_getphdrnum(in_elf, &phnum)) < 0) {
-    //     return STRIPS_PHNUM_FAILURE;
-    // }
-    // if ((gelf_newphdr(out_elf, phnum)) == NULL) {
-    //     return STRIPS_PHNUM_FAILURE;
-    // }
-    // // Update each program header
-    // for (size_t i = 0; i < phnum; ++i) {
-    //     GElf_Phdr phdr;
-    //     if (gelf_getphdr(in_elf, i, &phdr) == NULL) {
-    //         return STRIPS_PHDR_FAILURE;
-    //     }
-    //     if (gelf_update_phdr(out_elf, i, &phdr) == 0) {
-    //         return STRIPS_PHDR_FAILURE;
-    //     }
-    // }
+#ifdef MANUAL_PROGRAM_HEADER_UPDATE
+    size_t phnum;
+    if ((elf_getphdrnum(in_elf, &phnum)) < 0) {
+        return STRIPS_PHNUM_FAILURE;
+    }
+    if ((gelf_newphdr(out_elf, phnum)) == NULL) {
+        return STRIPS_PHNUM_FAILURE;
+    }
+    // Update each program header
+    for (size_t i = 0; i < phnum; ++i) {
+        GElf_Phdr phdr;
+        if (gelf_getphdr(in_elf, i, &phdr) == NULL) {
+            return STRIPS_PHDR_FAILURE;
+        }
+        if (gelf_update_phdr(out_elf, i, &phdr) == 0) {
+            return STRIPS_PHDR_FAILURE;
+        }
+    }
+#endif
     return STRIPS_OK;
 }
 
@@ -83,115 +86,92 @@ static STRIPS_ERROR strips_setshdrstrndx(Elf *elf, size_t shdrstrndx) {
     }
     return STRIPS_OK;
 }
-
-typedef struct {
-    GElf_Shdr shdr;
-    Elf_Scn *scn;
-    char *name;
-    size_t name_off;
-} keep_section_t;
-
-STRIPS_ERROR strips_move_sections(Elf *in_elf, Elf *out_elf,
+static STRIPS_ERROR
+strips_count_stripped_shdrstr_len(Elf *elf, const size_t shdrstr_idx,
+                                  size_t *new_len,
                                   const strip_policy_t policy) {
-    assert(in_elf);
-
-    STRIPS_ERROR_HANDLE(strips_update_headers(in_elf, out_elf));
-
-    size_t shdrstr_idx;
-    if (elf_getshdrstrndx(in_elf, &shdrstr_idx) != 0) {
-        return STRIPS_SHDR_FAILURE;
-    }
-
-    // get shstr table size
-    Elf_Scn *shdrstr_sec = elf_getscn(in_elf, shdrstr_idx);
-    GElf_Shdr shdrstr_shdr;
-    if (gelf_getshdr(shdrstr_sec, &shdrstr_shdr) == NULL) {
-        fprintf(stderr, "getshdr failed: %s\n", elf_errmsg(elf_errno()));
-        return STRIPS_SHDR_FAILURE;
-    }
-
-    size_t new_shdrstr_size = 1 + strlen(".shdrstr") + 1;
+    *new_len = 1 + strlen(".shdrstr") + 1;
     Elf_Scn *scn = NULL;
-    while ((scn = elf_nextscn(in_elf, scn)) != NULL) {
+    while ((scn = elf_nextscn(elf, scn)) != NULL) {
         GElf_Shdr shdr;
         gelf_getshdr(scn, &shdr);
-        char *name = elf_strptr(in_elf, shdrstr_idx, shdr.sh_name);
+        char *name = elf_strptr(elf, shdrstr_idx, shdr.sh_name);
         if (strips_should_strip(name, &shdr, policy) ||
             elf_ndxscn(scn) == shdrstr_idx) {
             continue;
         }
-        new_shdrstr_size += strlen(name) + 1;
+        *new_len += strlen(name) + 1;
     }
 
-    char *new_shdrstr = calloc(new_shdrstr_size, sizeof(*new_shdrstr));
-    size_t new_shdrstr_off = 1;
+    return STRIPS_OK;
+}
 
-    scn = NULL;
-    while ((scn = elf_nextscn(in_elf, scn)) != NULL) {
-        GElf_Shdr shdr;
-        if ((gelf_getshdr(scn, &shdr)) == NULL) {
-            fprintf(stderr, "getshdr failed: %s\n", elf_errmsg(elf_errno()));
-            continue;
-        }
-        char *name = elf_strptr(in_elf, shdrstr_idx, shdr.sh_name);
+static STRIPS_ERROR
+strips_process_section(Elf *in_elf, Elf *out_elf, Elf_Scn *scn,
+                       const size_t shdrstr_idx, const strip_policy_t policy,
+                       char *new_shdrstr, size_t *new_shdrstr_off) {
+    GElf_Shdr shdr;
+    if ((gelf_getshdr(scn, &shdr)) == NULL) {
+        fprintf(stderr, "getshdr failed: %s\n", elf_errmsg(elf_errno()));
+        return STRIPS_SHDR_FAILURE;
+    }
+    char *name = elf_strptr(in_elf, shdrstr_idx, shdr.sh_name);
 
-        if (strips_should_strip(name, &shdr, policy) ||
-            elf_ndxscn(scn) == shdrstr_idx) { // skip current shdrstr
-            continue;
-        }
+    if (strips_should_strip(name, &shdr, policy) ||
+        elf_ndxscn(scn) == shdrstr_idx) { // skip current shdrstr
+        return STRIPS_OK;
+    }
 
-        GElf_Shdr new_shdr = shdr;
-        new_shdr.sh_name = new_shdrstr_off;
+    GElf_Shdr new_shdr = shdr;
+    new_shdr.sh_name = *new_shdrstr_off;
 
-        // copy things to new section header table
-        strcpy(new_shdrstr + new_shdrstr_off, name);
-        new_shdrstr_off += strlen(name) + 1;
+    strcpy(new_shdrstr + *new_shdrstr_off, name);
+    *new_shdrstr_off += strlen(name) + 1;
 
-        Elf_Scn *new_scn = elf_newscn(out_elf);
+    Elf_Scn *new_scn = elf_newscn(out_elf);
+    // TODO: fix this cleanup
+    if (!new_scn) {
+        fprintf(stderr, "elf_newscn failed: %s\n", elf_errmsg(-1));
+        free(new_shdrstr);
+        return STRIPS_SHDR_FAILURE;
+    }
+
+    Elf_Data *i_data = NULL;
+    while ((i_data = elf_getdata(scn, i_data)) != NULL) {
+        Elf_Data *o_data = elf_newdata(new_scn);
+
         // TODO: fix this cleanup
-        if (!new_scn) {
-            fprintf(stderr, "elf_newscn failed: %s\n", elf_errmsg(-1));
+        if (!o_data) {
+            fprintf(stderr, "elf_newdata failed: %s\n", elf_errmsg(-1));
             free(new_shdrstr);
             return STRIPS_SHDR_FAILURE;
         }
 
-        Elf_Data *i_data = NULL;
-        while ((i_data = elf_getdata(scn, i_data)) != NULL) {
-            if (i_data->d_size == 0 || i_data->d_buf == NULL) {
-                // Nothing to copy; skip empty or NOBITS-like data
-                continue;
-            }
+        o_data->d_size = i_data->d_size;
 
-            Elf_Data *o_data = elf_newdata(new_scn);
-
-            // TODO: fix this cleanup
-            if (!o_data) {
-                fprintf(stderr, "elf_newdata failed: %s\n", elf_errmsg(-1));
-                free(new_shdrstr);
-                return STRIPS_SHDR_FAILURE;
-            }
-
-            o_data->d_buf =
-                calloc((i_data->d_size == 0 ? 1 : i_data->d_size) + 10, 1);
+        o_data->d_buf = calloc(i_data->d_size, 1);
+        if (i_data->d_buf != NULL) {
             memcpy(o_data->d_buf, i_data->d_buf, i_data->d_size);
+        }
 
-            o_data->d_size = i_data->d_size;
-            // o_data->d_off = i_data->d_off;
-            o_data->d_align = i_data->d_align;
-            o_data->d_type = i_data->d_type;
-            o_data->d_version = i_data->d_version;
-            elf_flagdata(o_data, ELF_C_SET, ELF_F_DIRTY);
-        }
-        // TODO: fix this cleanup
-        if (gelf_update_shdr(new_scn, &new_shdr) == 0) {
-            fprintf(stderr, "gelf_update_shdr failed: %s\n", elf_errmsg(-1));
-            free(new_shdrstr);
-            return STRIPS_SHDR_FAILURE;
-        }
+        // o_data->d_off = i_data->d_off;
+        o_data->d_align = i_data->d_align;
+        o_data->d_type = i_data->d_type;
+        o_data->d_version = i_data->d_version;
+        elf_flagdata(o_data, ELF_C_SET, ELF_F_DIRTY);
     }
+    // TODO: fix this cleanup
+    if (gelf_update_shdr(new_scn, &new_shdr) == 0) {
+        fprintf(stderr, "gelf_update_shdr failed: %s\n", elf_errmsg(-1));
+        free(new_shdrstr);
+        return STRIPS_SHDR_FAILURE;
+    }
+    return STRIPS_OK;
+}
 
-    strcpy(new_shdrstr + new_shdrstr_off, ".shdrstr");
-
+static STRIPS_ERROR strips_update_shdrstr_section(
+    Elf *out_elf, char *new_shdrstr, const size_t new_shdrstr_size,
+    const size_t new_shdrstr_off, const size_t new_shdrstr_name) {
     Elf_Scn *new_shdrstr_scn = elf_newscn(out_elf);
     Elf_Data *new_shdrstr_scn_data = elf_newdata(new_shdrstr_scn);
     new_shdrstr_scn_data->d_buf = new_shdrstr;
@@ -201,7 +181,7 @@ STRIPS_ERROR strips_move_sections(Elf *in_elf, Elf *out_elf,
     new_shdrstr_scn_data->d_version = EV_CURRENT;
 
     GElf_Shdr new_shdrstr_shdr = {};
-    new_shdrstr_shdr.sh_name = (GElf_Word)new_shdrstr_off;
+    new_shdrstr_shdr.sh_name = (GElf_Word)new_shdrstr_name;
     new_shdrstr_shdr.sh_type = SHT_STRTAB;
     new_shdrstr_shdr.sh_flags = 0;
     new_shdrstr_shdr.sh_addralign = 1;
@@ -223,9 +203,104 @@ STRIPS_ERROR strips_move_sections(Elf *in_elf, Elf *out_elf,
 
     STRIPS_ERROR_HANDLE(strips_setshdrstrndx(out_elf, new_shdrstrndx));
 
+    return STRIPS_OK;
+}
+
+STRIPS_ERROR strips_move_sections(Elf *in_elf, Elf *out_elf,
+                                  const strip_policy_t policy) {
+    assert(in_elf);
+
+    STRIPS_ERROR_HANDLE(strips_update_headers(in_elf, out_elf));
+
+    size_t shdrstr_idx;
+    if (elf_getshdrstrndx(in_elf, &shdrstr_idx) != 0) {
+        return STRIPS_SHDR_FAILURE;
+    }
+
+    size_t new_shdrstr_size = 0;
+    STRIPS_ERROR_HANDLE(strips_count_stripped_shdrstr_len(
+        in_elf, shdrstr_idx, &new_shdrstr_size, policy));
+
+    char *new_shdrstr = calloc(new_shdrstr_size, sizeof(*new_shdrstr));
+    const size_t new_shdrstr_name = 1;
+    strcpy(new_shdrstr + new_shdrstr_name, ".shdrstr");
+    size_t new_shdrstr_off = new_shdrstr_name + strlen(".shdrstr") + 1;
+
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(in_elf, scn)) != NULL) {
+        STRIPS_ERROR_HANDLE(
+            strips_process_section(in_elf, out_elf, scn, shdrstr_idx, policy,
+                                   new_shdrstr, &new_shdrstr_off));
+    }
+
+    STRIPS_ERROR_HANDLE(
+        strips_update_shdrstr_section(out_elf, new_shdrstr, new_shdrstr_size,
+                                      new_shdrstr_off, new_shdrstr_name));
+
+    // if (elf_update(out_elf, ELF_C_WRITE) < 0) {
+    //     fprintf(stderr, "elf_update failed: %s\n", elf_errmsg(elf_errno()));
+    //     exit(EXIT_FAILURE);
+    // }
+
+    /* Now recompute PT_LOAD entries to cover SHF_ALLOC sections */
+    size_t phnum = 0;
+    if (elf_getphdrnum(out_elf, &phnum) < 0) {
+        fprintf(stderr, "elf_getphdrnum failed: %s\n", elf_errmsg(elf_errno()));
+        return STRIPS_PHNUM_FAILURE;
+    }
+
+    for (size_t pi = 0; pi < phnum; ++pi) {
+        GElf_Phdr phdr;
+        if (gelf_getphdr(out_elf, pi, &phdr) == NULL) {
+            fprintf(stderr, "gelf_getphdr failed: %s\n",
+                    elf_errmsg(elf_errno()));
+            return STRIPS_PHDR_FAILURE;
+        }
+        // if (phdr.p_type != PT_LOAD)
+        //     continue;
+
+        /* compute new extents */
+        off_t min_off = -1;
+        off_t max_off = 0;
+        Elf_Scn *scn = NULL;
+        while ((scn = elf_nextscn(out_elf, scn)) != NULL) {
+            GElf_Shdr s;
+            if (gelf_getshdr(scn, &s) == NULL)
+                continue;
+            if (!(s.sh_flags & SHF_ALLOC))
+                continue; /* only loadable sections */
+
+            /* Use d_size/sh_size and sh_offset to detect coverage */
+            if (s.sh_offset >= phdr.p_offset &&
+                s.sh_offset < phdr.p_offset + phdr.p_filesz) {
+                off_t scn_start = s.sh_offset;
+                off_t scn_end = (off_t)(s.sh_offset + s.sh_size);
+                if (min_off == -1 || scn_start < min_off)
+                    min_off = scn_start;
+                if (scn_end > max_off)
+                    max_off = scn_end;
+            }
+        }
+
+        if (min_off != -1) {
+            phdr.p_offset = min_off;
+            phdr.p_filesz = (GElf_Word)(max_off - min_off);
+            phdr.p_memsz = phdr.p_filesz;
+            /* Optionally recompute p_vaddr/p_align etc. If sh_addr values are
+               set, choose p_vaddr = min(sh_addr) and p_memsz accordingly. */
+            if (gelf_update_phdr(out_elf, pi, &phdr) == 0) {
+                fprintf(stderr, "gelf_update_phdr failed: %s\n",
+                        elf_errmsg(elf_errno()));
+                return STRIPS_PHDR_FAILURE;
+            }
+        }
+    }
+
+    /* Finally write out with updated PHDRs */
     if (elf_update(out_elf, ELF_C_WRITE) < 0) {
-        fprintf(stderr, "elf_update failed: %s\n", elf_errmsg(elf_errno()));
-        exit(EXIT_FAILURE);
+        fprintf(stderr, "elf_update (final) failed: %s\n",
+                elf_errmsg(elf_errno()));
+        return STRIPS_FAILURE;
     }
 
     free(new_shdrstr);
