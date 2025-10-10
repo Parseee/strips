@@ -7,7 +7,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(project_compiler_options INTERFACE)
 target_compile_options(project_compiler_options INTERFACE
-    $<$<CONFIG:Debug>:-Wall -Wextra -fno-omit-frame-pointer>
+    $<$<CONFIG:Debug>:-Wall -Wextra -fno-omit-frame-pointer -fsanitize=address,leak>
     $<$<CONFIG:Release>:-O2>
 )
 
@@ -24,6 +24,6 @@ set(DEPS
 add_executable(${PROJECT_NAME} ${MAIN_SOURCES})
 # add target_link_options
 target_link_libraries(${PROJECT_NAME} PUBLIC project_compiler_options 
-    $<$<CONFIG:Debug>:>  
+    $<$<CONFIG:Debug>:-fsanitize=address,leak>  
     $<$<CONFIG:Release>:-O2>
     ${DEPS})

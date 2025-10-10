@@ -28,181 +28,623 @@ static bool strips_should_strip(const char *name, GElf_Shdr *sec_head,
     return remove;
 }
 
-static STRIPS_ERROR strips_update_headers(Elf *in_elf, Elf *out_elf) {
-    // Update ELF header
-    GElf_Ehdr in_ehdr;
-    if ((gelf_getehdr(in_elf, &in_ehdr)) == NULL) {
-        fprintf(stderr, "gelf_getehdr failed: %s", elf_errmsg(elf_errno()));
-        return STRIPS_EHDR_FAILURE;
+#define PAGE_ALIGN 0x10000
+#define ALIGN_DOWN(x, a) ((x) & ~((a)-1))
+#define ALIGN_UP(x, a) (((x) + (a)-1) & ~((a)-1))
+// #define ALIGN_DOWN(x, a) (x)
+// #define ALIGN_UP(x, a) (x)
+
+static STRIPS_ERROR recompute_program_headers1(Elf *in_elf, Elf *out_elf) {
+    if (!in_elf || !out_elf) {
+        fprintf(stderr, "recompute_program_headers: null elf ptr\n");
+        return STRIPS_FAILURE;
     }
 
-    GElf_Ehdr *out_ehdr = NULL;
-    if ((out_ehdr = gelf_newehdr(out_elf, gelf_getclass(in_elf))) == NULL) {
-        fprintf(stderr, "gelf_newehd failed: %s", elf_errmsg(elf_errno()));
-        return STRIPS_EHDR_FAILURE;
-    }
-    out_ehdr->e_machine = in_ehdr.e_machine;
-    out_ehdr->e_entry = in_ehdr.e_entry;
-    out_ehdr->e_type = in_ehdr.e_type;
-    out_ehdr->e_flags = in_ehdr.e_flags;
-
-    if (gelf_update_ehdr(out_elf, out_ehdr) == 0) {
-        fprintf(stderr, "gelf_update_ehdr failed: %s", elf_errmsg(elf_errno()));
-        return STRIPS_EHDR_FAILURE;
-    }
-
-#ifdef MANUAL_PROGRAM_HEADER_UPDATE
-    size_t phnum;
-    if ((elf_getphdrnum(in_elf, &phnum)) < 0) {
+    size_t out_phnum = 0;
+    if (elf_getphdrnum(out_elf, &out_phnum) != 0) {
+        fprintf(stderr, "elf_getphdrnum(out) failed: %s\n", elf_errmsg(-1));
         return STRIPS_PHNUM_FAILURE;
     }
-    if ((gelf_newphdr(out_elf, phnum)) == NULL) {
-        return STRIPS_PHNUM_FAILURE;
-    }
-    // Update each program header
-    for (size_t i = 0; i < phnum; ++i) {
-        GElf_Phdr phdr;
-        if (gelf_getphdr(in_elf, i, &phdr) == NULL) {
-            return STRIPS_PHDR_FAILURE;
-        }
-        if (gelf_update_phdr(out_elf, i, &phdr) == 0) {
-            return STRIPS_PHDR_FAILURE;
-        }
-    }
-#endif
-    return STRIPS_OK;
-}
 
-static STRIPS_ERROR strips_setshdrstrndx(Elf *elf, size_t shdrstrndx) {
-    GElf_Ehdr ehdr;
-    if (gelf_getehdr(elf, &ehdr) == NULL) {
-        fprintf(stderr, "gelf_getehdr failed: %s", elf_errmsg(elf_errno()));
-        return STRIPS_EHDR_FAILURE;
+    size_t shstrndx;
+    if (elf_getshdrstrndx(out_elf, &shstrndx) != 0) {
+        fprintf(stderr, "elf_getshdrstrndx(out) failed: %s\n", elf_errmsg(-1));
+        return STRIPS_SHDR_FAILURE;
     }
-    ehdr.e_shstrndx = shdrstrndx;
-    if (gelf_update_ehdr(elf, &ehdr) == 0) {
-        fprintf(stderr, "gelf_update_ehdr failed: %s", elf_errmsg(elf_errno()));
-        return STRIPS_EHDR_FAILURE;
-    }
-    return STRIPS_OK;
-}
-static STRIPS_ERROR
-strips_count_stripped_shdrstr_len(Elf *elf, const size_t shdrstr_idx,
-                                  size_t *new_len,
-                                  const strip_policy_t policy) {
-    *new_len = 1 + strlen(".shdrstr") + 1;
+
+    Elf64_Addr text_min_off = UINT64_MAX, text_max_off = 0;
+    Elf64_Addr text_min_addr = UINT64_MAX, text_max_addr = 0;
+    Elf64_Addr data_min_off = UINT64_MAX, data_max_off = 0;
+    Elf64_Addr data_min_addr = UINT64_MAX, data_max_addr = 0;
+    Elf64_Addr dyn_min_off = UINT64_MAX, dyn_max_off = 0;
+    Elf64_Addr dyn_min_addr = UINT64_MAX, dyn_max_addr = 0;
+
     Elf_Scn *scn = NULL;
-    while ((scn = elf_nextscn(elf, scn)) != NULL) {
-        GElf_Shdr shdr;
-        gelf_getshdr(scn, &shdr);
-        char *name = elf_strptr(elf, shdrstr_idx, shdr.sh_name);
-        if (strips_should_strip(name, &shdr, policy) ||
-            elf_ndxscn(scn) == shdrstr_idx) {
+    while ((scn = elf_nextscn(out_elf, scn)) != NULL) {
+        GElf_Shdr sh;
+        if (!gelf_getshdr(scn, &sh))
             continue;
+
+        if (!(sh.sh_flags & SHF_ALLOC))
+            continue;
+
+        const char *name = elf_strptr(out_elf, shstrndx, sh.sh_name);
+        if (!name)
+            continue;
+
+        bool exec = (sh.sh_flags & SHF_EXECINSTR) != 0;
+        bool write = (sh.sh_flags & SHF_WRITE) != 0;
+
+        if (strcmp(name, ".dynamic") == 0) {
+            if (sh.sh_offset < dyn_min_off)
+                dyn_min_off = sh.sh_offset;
+            if (sh.sh_offset + sh.sh_size > dyn_max_off)
+                dyn_max_off = sh.sh_offset + sh.sh_size;
+            if (sh.sh_addr < dyn_min_addr)
+                dyn_min_addr = sh.sh_addr;
+            if (sh.sh_addr + sh.sh_size > dyn_max_addr)
+                dyn_max_addr = sh.sh_addr + sh.sh_size;
+        } else if (exec || (!write && !exec)) {
+            // TEXT / RO sections
+            if (sh.sh_offset < text_min_off)
+                text_min_off = sh.sh_offset;
+            if (sh.sh_offset + sh.sh_size > text_max_off)
+                text_max_off = sh.sh_offset + sh.sh_size;
+            if (sh.sh_addr < text_min_addr)
+                text_min_addr = sh.sh_addr;
+            if (sh.sh_addr + sh.sh_size > text_max_addr)
+                text_max_addr = sh.sh_addr + sh.sh_size;
+        } else if (write) {
+            // DATA sections
+            if (sh.sh_offset < data_min_off)
+                data_min_off = sh.sh_offset;
+            if (sh.sh_offset + sh.sh_size > data_max_off)
+                data_max_off = sh.sh_offset + sh.sh_size;
+            if (sh.sh_addr < data_min_addr)
+                data_min_addr = sh.sh_addr;
+            if (sh.sh_addr + sh.sh_size > data_max_addr)
+                data_max_addr = sh.sh_addr + sh.sh_size;
         }
-        *new_len += strlen(name) + 1;
     }
 
+    Elf64_Phdr *phdr = elf64_getphdr(out_elf);
+    if (!phdr) {
+        fprintf(stderr, "elf64_getphdr(out) failed: %s\n", elf_errmsg(-1));
+        return STRIPS_PHDR_FAILURE;
+    }
+
+    GElf_Ehdr *eh = elf64_getehdr(out_elf);
+    if (!eh) {
+        fprintf(stderr, "elf64_getehdr(out) failed\n");
+        return STRIPS_FAILURE;
+    }
+
+    for (size_t i = 0; i < out_phnum; ++i) {
+        switch (phdr[i].p_type) {
+        case PT_LOAD:
+            if ((phdr[i].p_flags & PF_X) || !(phdr[i].p_flags & PF_W)) {
+                // TEXT segment
+                if (text_min_off != UINT64_MAX) {
+                    // phdr[i].p_offset =
+                    ALIGN_DOWN(text_min_off, PAGE_ALIGN);
+                    phdr[i].p_offset = 0;
+                    // phdr[i].p_vaddr =
+                    ALIGN_DOWN(text_min_addr, PAGE_ALIGN);
+                    phdr[i].p_vaddr = 0;
+                    phdr[i].p_paddr = phdr[i].p_vaddr;
+                    phdr[i].p_filesz =
+                        ALIGN_UP(text_max_off - phdr[i].p_offset, PAGE_ALIGN);
+                    phdr[i].p_memsz =
+                        ALIGN_UP(text_max_addr - phdr[i].p_vaddr, PAGE_ALIGN);
+                    phdr[i].p_flags = PF_R | PF_X;
+                    phdr[i].p_align = PAGE_ALIGN;
+                }
+            } else {
+                // DATA segment
+                if (data_min_off != UINT64_MAX) {
+                    phdr[i].p_offset = ALIGN_DOWN(data_min_off, PAGE_ALIGN);
+                    phdr[i].p_vaddr = ALIGN_DOWN(data_min_addr, PAGE_ALIGN);
+                    phdr[i].p_paddr = phdr[i].p_vaddr;
+                    phdr[i].p_filesz =
+                        ALIGN_UP(data_max_off - phdr[i].p_offset, PAGE_ALIGN);
+                    phdr[i].p_memsz =
+                        ALIGN_UP(data_max_addr - phdr[i].p_vaddr, PAGE_ALIGN);
+                    phdr[i].p_flags = PF_R | PF_W;
+                    phdr[i].p_align = PAGE_ALIGN;
+                }
+            }
+            break;
+
+        case PT_DYNAMIC:
+            if (dyn_min_off != UINT64_MAX) {
+                phdr[i].p_offset = dyn_min_off;
+                phdr[i].p_vaddr = dyn_min_addr;
+                phdr[i].p_paddr = phdr[i].p_vaddr;
+                phdr[i].p_filesz = dyn_max_off - dyn_min_off;
+                phdr[i].p_memsz = dyn_max_addr - dyn_min_addr;
+                phdr[i].p_flags = PF_R | PF_W;
+                phdr[i].p_align = sizeof(Elf64_Addr);
+            }
+            break;
+
+        case PT_PHDR:
+            phdr[i].p_offset = eh->e_phoff;
+            phdr[i].p_vaddr = 0;
+            phdr[i].p_paddr = 0;
+            phdr[i].p_filesz = elf64_fsize(ELF_T_PHDR, out_phnum, EV_CURRENT);
+            phdr[i].p_memsz = phdr[i].p_filesz;
+            phdr[i].p_flags = PF_R;
+            phdr[i].p_align = sizeof(Elf64_Addr);
+            break;
+
+        case PT_INTERP: {
+            Elf_Scn *s = NULL;
+            while ((s = elf_nextscn(out_elf, s)) != NULL) {
+                GElf_Shdr sh;
+                if (!gelf_getshdr(s, &sh))
+                    continue;
+                const char *nm = elf_strptr(out_elf, shstrndx, sh.sh_name);
+                if (nm && strcmp(nm, ".interp") == 0) {
+                    phdr[i].p_offset = sh.sh_offset;
+                    phdr[i].p_vaddr = sh.sh_addr;
+                    phdr[i].p_paddr = sh.sh_addr;
+                    phdr[i].p_filesz = sh.sh_size;
+                    phdr[i].p_memsz = sh.sh_size;
+                    phdr[i].p_flags = PF_R;
+                    phdr[i].p_align = 0x1;
+                    break;
+                }
+            }
+            break;
+        }
+
+        case PT_GNU_RELRO:
+            if (data_min_off != UINT64_MAX) {
+                phdr[i].p_offset = ALIGN_DOWN(data_min_off, 0x1);
+                phdr[i].p_vaddr = ALIGN_DOWN(data_min_addr, 0x1);
+                phdr[i].p_paddr = phdr[i].p_vaddr;
+                // RELRO size = from start of data to end of read-only
+                phdr[i].p_filesz =
+                    ALIGN_UP(data_max_off - phdr[i].p_offset, 0x1);
+                phdr[i].p_memsz = phdr[i].p_filesz;
+                phdr[i].p_flags = PF_R;
+                phdr[i].p_align = 0x1;
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    elf_flagphdr(out_elf, ELF_C_SET, ELF_F_DIRTY);
     return STRIPS_OK;
 }
 
-static STRIPS_ERROR
-strips_process_section(Elf *in_elf, Elf *out_elf, Elf_Scn *scn,
-                       const size_t shdrstr_idx, const strip_policy_t policy,
-                       char *new_shdrstr, size_t *new_shdrstr_off) {
-    GElf_Shdr shdr;
-    if ((gelf_getshdr(scn, &shdr)) == NULL) {
-        fprintf(stderr, "getshdr failed: %s\n", elf_errmsg(elf_errno()));
-        return STRIPS_SHDR_FAILURE;
-    }
-    char *name = elf_strptr(in_elf, shdrstr_idx, shdr.sh_name);
-
-    if (strips_should_strip(name, &shdr, policy) ||
-        elf_ndxscn(scn) == shdrstr_idx) { // skip current shdrstr
-        return STRIPS_OK;
+static STRIPS_ERROR recompute_program_headers(Elf *in_elf, Elf *out_elf) {
+    if (!in_elf || !out_elf) {
+        fprintf(stderr, "recompute_program_headers: null elf ptr\n");
+        return STRIPS_FAILURE;
     }
 
-    GElf_Shdr new_shdr = shdr;
-    new_shdr.sh_name = *new_shdrstr_off;
+    size_t out_phnum = 0;
+    if (elf_getphdrnum(out_elf, &out_phnum) != 0) {
+        fprintf(stderr, "elf_getphdrnum(out) failed: %s\n", elf_errmsg(-1));
+        return STRIPS_PHNUM_FAILURE;
+    }
 
-    strcpy(new_shdrstr + *new_shdrstr_off, name);
-    *new_shdrstr_off += strlen(name) + 1;
-
-    Elf_Scn *new_scn = elf_newscn(out_elf);
-    // TODO: fix this cleanup
-    if (!new_scn) {
-        fprintf(stderr, "elf_newscn failed: %s\n", elf_errmsg(-1));
-        free(new_shdrstr);
+    size_t shstrndx;
+    if (elf_getshdrstrndx(out_elf, &shstrndx) != 0) {
+        fprintf(stderr, "elf_getshdrstrndx(out) failed: %s\n", elf_errmsg(-1));
         return STRIPS_SHDR_FAILURE;
     }
 
-    Elf_Data *i_data = NULL;
-    while ((i_data = elf_getdata(scn, i_data)) != NULL) {
-        Elf_Data *o_data = elf_newdata(new_scn);
+    Elf64_Phdr *phdr = elf64_getphdr(out_elf);
+    if (!phdr) {
+        fprintf(stderr, "elf64_getphdr(out) failed: %s\n", elf_errmsg(-1));
+        return STRIPS_PHDR_FAILURE;
+    }
 
-        // TODO: fix this cleanup
-        if (!o_data) {
-            fprintf(stderr, "elf_newdata failed: %s\n", elf_errmsg(-1));
-            free(new_shdrstr);
-            return STRIPS_SHDR_FAILURE;
+    GElf_Ehdr *eh = elf64_getehdr(out_elf);
+    if (!eh) {
+        fprintf(stderr, "elf64_getehdr(out) failed\n");
+        return STRIPS_FAILURE;
+    }
+
+/* helper: check name against NULL-terminated list */
+#define MATCH_NAME_IN_LIST(n, list)                                            \
+    ({                                                                         \
+        const char *___n = (n);                                                \
+        bool ___m = false;                                                     \
+        if (___n) {                                                            \
+            for (const char *const *___p = (list); *___p != NULL; ++___p) {    \
+                if (strcmp(___n, *___p) == 0) {                                \
+                    ___m = true;                                               \
+                    break;                                                     \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        ___m;                                                                  \
+    })
+
+    /* section name lists -- extend these lists to taste */
+    const char *dynamic_names[] = {".dynamic", NULL};
+
+    const char *interp_names[] = {".interp", NULL};
+
+    const char *note_names[] = {".note.gnu.build-id", ".note.ABI-tag", NULL};
+
+    const char *ehframe_names[] = {".eh_frame_hdr", NULL};
+
+    const char *relro_names[] = {".dynamic", ".got", ".init_array",
+                                 ".fini_array", NULL};
+
+    const char *text_like_names[] = {".interp",
+                                     ".note.gnu.build-id",
+                                     ".note.ABI-tag",
+                                     ".gnu.hash",
+                                     ".dynsym",
+                                     ".dynstr",
+                                     ".gnu.version",
+                                     ".gnu.version_r",
+                                     ".rela.dyn",
+                                     ".rela.plt",
+                                     ".init",
+                                     ".plt",
+                                     ".text",
+                                     ".fini",
+                                     ".rodata",
+                                     ".plt.got",
+                                     ".plt.sec",
+                                     ".gcc_except_table",
+                                     ".eh_frame_hdr",
+                                     ".eh_frame",
+                                     NULL};
+
+    const char *data_like_names[] = {
+        ".init_array", ".fini_array", ".dynamic", ".data", ".bss",
+        ".got",        ".got.plt",    ".tdata",   ".tbss", NULL};
+
+    /* iterate headers */
+    for (size_t i = 0; i < out_phnum; ++i) {
+        Elf64_Addr min_off = UINT64_MAX, max_off = 0;
+        Elf64_Addr min_addr = UINT64_MAX, max_addr = 0;
+        bool any = false;
+
+        switch (phdr[i].p_type) {
+        case PT_LOAD: {
+            bool is_text =
+                (phdr[i].p_flags & PF_X) || !(phdr[i].p_flags & PF_W);
+
+            Elf_Scn *s = NULL;
+            while ((s = elf_nextscn(out_elf, s)) != NULL) {
+                GElf_Shdr sh;
+                if (!gelf_getshdr(s, &sh))
+                    continue;
+
+                /* only consider alloc sections */
+                if (!(sh.sh_flags & SHF_ALLOC))
+                    continue;
+
+                const char *name = elf_strptr(out_elf, shstrndx, sh.sh_name);
+                if (!name)
+                    continue;
+
+                bool include = false;
+
+                if (is_text) {
+                    if (MATCH_NAME_IN_LIST(name, text_like_names))
+                        include = true;
+                    else if (!(sh.sh_flags & SHF_WRITE))
+                        include = true;
+                } else {
+                    if (MATCH_NAME_IN_LIST(name, data_like_names))
+                        include = true;
+                    else if (sh.sh_flags & SHF_WRITE)
+                        include = true;
+                }
+
+                if (!include)
+                    continue;
+
+                /* track bounds */
+                any = true;
+                if (sh.sh_offset < min_off)
+                    min_off = sh.sh_offset;
+                if (sh.sh_offset + sh.sh_size > max_off)
+                    max_off = sh.sh_offset + sh.sh_size;
+                if (sh.sh_addr < min_addr)
+                    min_addr = sh.sh_addr;
+                if (sh.sh_addr + sh.sh_size > max_addr)
+                    max_addr = sh.sh_addr + sh.sh_size;
+            }
+
+            if (any) {
+                /* PT_LOADs must be page-aligned for the kernel */
+                phdr[i].p_offset =
+                    (is_text) ? 0 : ALIGN_DOWN(min_off, PAGE_ALIGN);
+                phdr[i].p_vaddr =
+                    (is_text) ? 0 : ALIGN_DOWN(min_addr, PAGE_ALIGN);
+                phdr[i].p_paddr = phdr[i].p_vaddr;
+                phdr[i].p_filesz =
+                    ALIGN_UP(max_off - phdr[i].p_offset, PAGE_ALIGN);
+                phdr[i].p_memsz =
+                    ALIGN_UP(max_addr - phdr[i].p_vaddr, PAGE_ALIGN);
+                /* preserve execute/write flags but ensure readable */
+                phdr[i].p_flags = (phdr[i].p_flags & (PF_X | PF_W)) | PF_R;
+                phdr[i].p_align = PAGE_ALIGN;
+            } else {
+                /* no matching sections: zero it out (optional) */
+                phdr[i].p_offset = 0;
+                phdr[i].p_vaddr = 0;
+                phdr[i].p_paddr = 0;
+                phdr[i].p_filesz = 0;
+                phdr[i].p_memsz = 0;
+                phdr[i].p_flags = 0;
+                phdr[i].p_align = 0;
+            }
+        } break;
+
+        case PT_DYNAMIC:
+            /* include only dynamic-related sections; keep PT_DYNAMIC narrow (no
+             * page-align) */
+            {
+                Elf_Scn *s = NULL;
+                while ((s = elf_nextscn(out_elf, s)) != NULL) {
+                    GElf_Shdr sh;
+                    if (!gelf_getshdr(s, &sh))
+                        continue;
+
+                    if (!(sh.sh_flags & SHF_ALLOC))
+                        continue;
+
+                    const char *name =
+                        elf_strptr(out_elf, shstrndx, sh.sh_name);
+                    if (!name)
+                        continue;
+
+                    if (!MATCH_NAME_IN_LIST(name, dynamic_names))
+                        continue;
+
+                    any = true;
+                    if (sh.sh_offset < min_off)
+                        min_off = sh.sh_offset;
+                    if (sh.sh_offset + sh.sh_size > max_off)
+                        max_off = sh.sh_offset + sh.sh_size;
+                    if (sh.sh_addr < min_addr)
+                        min_addr = sh.sh_addr;
+                    if (sh.sh_addr + sh.sh_size > max_addr)
+                        max_addr = sh.sh_addr + sh.sh_size;
+                }
+
+                if (any) {
+                    /* keep exact .dynamic bounds (no ALIGN_DOWN) and small
+                     * alignment */
+                    phdr[i].p_offset = min_off;
+                    phdr[i].p_vaddr = min_addr;
+                    phdr[i].p_paddr = phdr[i].p_vaddr;
+                    phdr[i].p_filesz = (max_off - min_off);
+                    phdr[i].p_memsz = (max_addr - min_addr);
+                    phdr[i].p_flags = PF_R | PF_W; /* dynamic is usually RW */
+                    phdr[i].p_align = sizeof(Elf64_Addr);
+                } else {
+                    phdr[i].p_offset = 0;
+                    phdr[i].p_vaddr = 0;
+                    phdr[i].p_paddr = 0;
+                    phdr[i].p_filesz = 0;
+                    phdr[i].p_memsz = 0;
+                    phdr[i].p_flags = 0;
+                    phdr[i].p_align = 0;
+                }
+            }
+            break;
+
+        case PT_INTERP: {
+            Elf_Scn *s = NULL;
+            while ((s = elf_nextscn(out_elf, s)) != NULL) {
+                GElf_Shdr sh;
+                if (!gelf_getshdr(s, &sh))
+                    continue;
+                const char *name = elf_strptr(out_elf, shstrndx, sh.sh_name);
+                if (!name)
+                    continue;
+                if (!MATCH_NAME_IN_LIST(name, interp_names))
+                    continue;
+
+                any = true;
+                if (sh.sh_offset < min_off)
+                    min_off = sh.sh_offset;
+                if (sh.sh_offset + sh.sh_size > max_off)
+                    max_off = sh.sh_offset + sh.sh_size;
+                if (sh.sh_addr < min_addr)
+                    min_addr = sh.sh_addr;
+                if (sh.sh_addr + sh.sh_size > max_addr)
+                    max_addr = sh.sh_addr + sh.sh_size;
+            }
+
+            if (any) {
+                phdr[i].p_offset = min_off;
+                phdr[i].p_vaddr = min_addr;
+                phdr[i].p_paddr = phdr[i].p_vaddr;
+                phdr[i].p_filesz = (max_off - min_off);
+                phdr[i].p_memsz = (max_addr - min_addr);
+                phdr[i].p_flags = PF_R;
+                phdr[i].p_align = 1;
+            } else {
+                phdr[i].p_offset = 0;
+                phdr[i].p_vaddr = 0;
+                phdr[i].p_paddr = 0;
+                phdr[i].p_filesz = 0;
+                phdr[i].p_memsz = 0;
+                phdr[i].p_flags = 0;
+                phdr[i].p_align = 0;
+            }
+        } break;
+
+        case PT_NOTE: {
+            Elf_Scn *s = NULL;
+            while ((s = elf_nextscn(out_elf, s)) != NULL) {
+                GElf_Shdr sh;
+                if (!gelf_getshdr(s, &sh))
+                    continue;
+                const char *name = elf_strptr(out_elf, shstrndx, sh.sh_name);
+                if (!name)
+                    continue;
+                /* include any .note.* section or known note names */
+                if (strncmp(name, ".note", 5) != 0 &&
+                    !MATCH_NAME_IN_LIST(name, note_names))
+                    continue;
+
+                any = true;
+                if (sh.sh_offset < min_off)
+                    min_off = sh.sh_offset;
+                if (sh.sh_offset + sh.sh_size > max_off)
+                    max_off = sh.sh_offset + sh.sh_size;
+                if (sh.sh_addr < min_addr)
+                    min_addr = sh.sh_addr;
+                if (sh.sh_addr + sh.sh_size > max_addr)
+                    max_addr = sh.sh_addr + sh.sh_size;
+            }
+
+            if (any) {
+                phdr[i].p_offset = min_off;
+                phdr[i].p_vaddr = min_addr;
+                phdr[i].p_paddr = phdr[i].p_vaddr;
+                phdr[i].p_filesz = (max_off - min_off);
+                phdr[i].p_memsz = (max_addr - min_addr);
+                phdr[i].p_flags = PF_R;
+                phdr[i].p_align = 4;
+            } else {
+                phdr[i].p_offset = 0;
+                phdr[i].p_vaddr = 0;
+                phdr[i].p_paddr = 0;
+                phdr[i].p_filesz = 0;
+                phdr[i].p_memsz = 0;
+                phdr[i].p_flags = 0;
+                phdr[i].p_align = 0;
+            }
+        } break;
+
+        case PT_GNU_EH_FRAME: {
+            Elf_Scn *s = NULL;
+            while ((s = elf_nextscn(out_elf, s)) != NULL) {
+                GElf_Shdr sh;
+                if (!gelf_getshdr(s, &sh))
+                    continue;
+                const char *name = elf_strptr(out_elf, shstrndx, sh.sh_name);
+                if (!name)
+                    continue;
+                if (!MATCH_NAME_IN_LIST(name, ehframe_names))
+                    continue;
+
+                any = true;
+                if (sh.sh_offset < min_off)
+                    min_off = sh.sh_offset;
+                if (sh.sh_offset + sh.sh_size > max_off)
+                    max_off = sh.sh_offset + sh.sh_size;
+                if (sh.sh_addr < min_addr)
+                    min_addr = sh.sh_addr;
+                if (sh.sh_addr + sh.sh_size > max_addr)
+                    max_addr = sh.sh_addr + sh.sh_size;
+            }
+
+            if (any) {
+                phdr[i].p_offset = min_off;
+                phdr[i].p_vaddr = min_addr;
+                phdr[i].p_paddr = phdr[i].p_vaddr;
+                phdr[i].p_filesz = (max_off - min_off);
+                phdr[i].p_memsz = (max_addr - min_addr);
+                phdr[i].p_flags = PF_R;
+                phdr[i].p_align = 4;
+            } else {
+                phdr[i].p_offset = 0;
+                phdr[i].p_vaddr = 0;
+                phdr[i].p_paddr = 0;
+                phdr[i].p_filesz = 0;
+                phdr[i].p_memsz = 0;
+                phdr[i].p_flags = 0;
+                phdr[i].p_align = 0;
+            }
+        } break;
+
+        case PT_GNU_RELRO: {
+            Elf_Scn *s = NULL;
+            while ((s = elf_nextscn(out_elf, s)) != NULL) {
+                GElf_Shdr sh;
+                if (!gelf_getshdr(s, &sh))
+                    continue;
+                if (!(sh.sh_flags & SHF_ALLOC))
+                    continue;
+                const char *name = elf_strptr(out_elf, shstrndx, sh.sh_name);
+                if (!name)
+                    continue;
+                if (!MATCH_NAME_IN_LIST(name, relro_names))
+                    continue;
+
+                any = true;
+                if (sh.sh_offset < min_off)
+                    min_off = sh.sh_offset;
+                if (sh.sh_offset + sh.sh_size > max_off)
+                    max_off = sh.sh_offset + sh.sh_size;
+                if (sh.sh_addr < min_addr)
+                    min_addr = sh.sh_addr;
+                if (sh.sh_addr + sh.sh_size > max_addr)
+                    max_addr = sh.sh_addr + sh.sh_size;
+            }
+
+            if (any) {
+                // phdr[i].p_offset = ALIGN_DOWN(min_off, PAGE_ALIGN);
+                phdr[i].p_offset = min_off;
+                // phdr[i].p_vaddr = ALIGN_DOWN(min_addr, PAGE_ALIGN);
+                phdr[i].p_vaddr = min_addr;
+                phdr[i].p_paddr = phdr[i].p_vaddr;
+                phdr[i].p_filesz = max_off - phdr[i].p_offset;
+                phdr[i].p_memsz = phdr[i].p_filesz;
+                phdr[i].p_flags = PF_R;
+                phdr[i].p_align = 0x1;
+            } else {
+                phdr[i].p_offset = 0;
+                phdr[i].p_vaddr = 0;
+                phdr[i].p_paddr = 0;
+                phdr[i].p_filesz = 0;
+                phdr[i].p_memsz = 0;
+                phdr[i].p_flags = 0;
+                phdr[i].p_align = 0;
+            }
+        } break;
+
+        case PT_PHDR:
+            phdr[i].p_offset = eh->e_phoff;
+            phdr[i].p_vaddr = phdr[i].p_offset;
+            phdr[i].p_paddr = phdr[i].p_offset;
+            phdr[i].p_filesz = elf64_fsize(ELF_T_PHDR, out_phnum, EV_CURRENT);
+            phdr[i].p_memsz = phdr[i].p_filesz;
+            phdr[i].p_flags = PF_R;
+            phdr[i].p_align = sizeof(Elf64_Addr);
+            break;
+
+        default:
+            /* For other segment types (e.g. PT_TLS, PT_NOTE already handled)
+               try a generic name-based inclusion: include any section that
+               exactly matches the segment name set you care about - nothing by
+               default. */
+            { /* If you want to handle PT_TLS etc. add cases here */
+            }
+            break;
+        } /* switch */
+    }     /* for phdr */
+
+    Elf64_Addr entry = 0;
+    for (size_t i = 0; i < out_phnum; ++i) {
+        if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X)) {
+            entry = phdr[i].p_vaddr;
+            break;
         }
-
-        o_data->d_size = i_data->d_size;
-
-        o_data->d_buf = calloc(i_data->d_size, 1);
-        if (i_data->d_buf != NULL) {
-            memcpy(o_data->d_buf, i_data->d_buf, i_data->d_size);
-        }
-
-        // o_data->d_off = i_data->d_off;
-        o_data->d_align = i_data->d_align;
-        o_data->d_type = i_data->d_type;
-        o_data->d_version = i_data->d_version;
-        elf_flagdata(o_data, ELF_C_SET, ELF_F_DIRTY);
     }
-    // TODO: fix this cleanup
-    if (gelf_update_shdr(new_scn, &new_shdr) == 0) {
-        fprintf(stderr, "gelf_update_shdr failed: %s\n", elf_errmsg(-1));
-        free(new_shdrstr);
-        return STRIPS_SHDR_FAILURE;
-    }
-    return STRIPS_OK;
-}
+    Elf64_Ehdr *out_ehdr = elf64_getehdr(out_elf);
+    out_ehdr->e_entry = entry;
 
-static STRIPS_ERROR strips_update_shdrstr_section(
-    Elf *out_elf, char *new_shdrstr, const size_t new_shdrstr_size,
-    const size_t new_shdrstr_off, const size_t new_shdrstr_name) {
-    Elf_Scn *new_shdrstr_scn = elf_newscn(out_elf);
-    Elf_Data *new_shdrstr_scn_data = elf_newdata(new_shdrstr_scn);
-    new_shdrstr_scn_data->d_buf = new_shdrstr;
-    new_shdrstr_scn_data->d_size = new_shdrstr_size;
-    new_shdrstr_scn_data->d_align = 1;
-    new_shdrstr_scn_data->d_off = 0;
-    new_shdrstr_scn_data->d_version = EV_CURRENT;
-
-    GElf_Shdr new_shdrstr_shdr = {};
-    new_shdrstr_shdr.sh_name = (GElf_Word)new_shdrstr_name;
-    new_shdrstr_shdr.sh_type = SHT_STRTAB;
-    new_shdrstr_shdr.sh_flags = 0;
-    new_shdrstr_shdr.sh_addralign = 1;
-    new_shdrstr_shdr.sh_entsize = 0;
-    new_shdrstr_shdr.sh_size = new_shdrstr_off;
-
-    if (gelf_update_shdr(new_shdrstr_scn, &new_shdrstr_shdr) == 0) {
-        fprintf(stderr, "gelf_update_shdr failed: %s", elf_errmsg(elf_errno()));
-        // TODO: cleanup
-        return STRIPS_SHDR_FAILURE;
-    }
-
-    size_t new_shdrstrndx = elf_ndxscn(new_shdrstr_scn);
-    if (new_shdrstrndx == SHN_UNDEF) {
-        // TODO: fix cleanup
-        fprintf(stderr, "elf_ndxscn failed for shstr\n");
-        return STRIPS_SHDR_FAILURE;
-    }
-
-    STRIPS_ERROR_HANDLE(strips_setshdrstrndx(out_elf, new_shdrstrndx));
-
+    elf_flagphdr(out_elf, ELF_C_SET, ELF_F_DIRTY);
     return STRIPS_OK;
 }
 
@@ -210,100 +652,117 @@ STRIPS_ERROR strips_move_sections(Elf *in_elf, Elf *out_elf,
                                   const strip_policy_t policy) {
     assert(in_elf);
 
-    STRIPS_ERROR_HANDLE(strips_update_headers(in_elf, out_elf));
+    Elf64_Ehdr *in_ehdr;
+    Elf64_Phdr *in_phdr;
+
+    Elf64_Ehdr *out_ehdr;
+    Elf64_Phdr *out_phdr;
+
+    if ((in_ehdr = elf64_getehdr(in_elf)) == NULL) {
+        ERROR("elf64_getehdr failed\n");
+    }
+
+    if ((out_ehdr = elf64_newehdr(out_elf)) == NULL) {
+        ERROR("elf64_newehdr failed\n");
+    }
+
+    memcpy(out_ehdr->e_ident, in_ehdr->e_ident, EI_NIDENT);
+    out_ehdr->e_type = in_ehdr->e_type;
+    out_ehdr->e_machine = in_ehdr->e_machine;
+    out_ehdr->e_version = in_ehdr->e_version;
+    out_ehdr->e_entry = in_ehdr->e_entry;
+    out_ehdr->e_flags = in_ehdr->e_flags;
+
+    size_t in_phnum = 0;
+    if ((elf_getphdrnum(in_elf, &in_phnum)) < 0) {
+        ERROR("elf_getphdrnum failed\n");
+    }
+
+    if ((in_phdr = elf64_getphdr(in_elf)) == NULL) {
+        ERROR("elf64_getphdr failed\n");
+    }
+
+    if ((out_phdr = elf64_newphdr(out_elf, in_phnum)) == NULL) {
+        ERROR("elf64_newphdr failed\n");
+    }
+
+    for (size_t i = 0; i < in_phnum; ++i) {
+        // out_phdr[i].p_align = in_phdr[i].p_align;
+        // out_phdr[i].p_filesz = in_phdr[i].p_filesz;
+        // out_phdr[i].p_flags = in_phdr[i].p_flags;
+        // out_phdr[i].p_memsz = in_phdr[i].p_memsz;
+        // out_phdr[i].p_offset = in_phdr[i].p_offset;
+        // out_phdr[i].p_paddr = in_phdr[i].p_paddr;
+        // out_phdr[i].p_type = in_phdr[i].p_type;
+        // out_phdr[i].p_vaddr = in_phdr[i].p_vaddr;
+        out_phdr[i] = in_phdr[i];
+    }
+
+    size_t shdrstrndx = 0;
+    if (elf_getshdrstrndx(in_elf, &shdrstrndx) < 0) {
+        return STRIPS_SHDR_FAILURE;
+    }
+
+    Elf_Scn *in_scn = NULL;
+    while ((in_scn = elf_nextscn(in_elf, in_scn)) != NULL) {
+        Elf_Scn *out_scn = elf_newscn(out_elf);
+
+        Elf_Data *in_data = NULL;
+        while ((in_data = elf_getdata(in_scn, in_data)) != NULL) {
+            Elf_Data *out_data = NULL;
+            if ((out_data = elf_newdata(out_scn)) != NULL) {
+                out_data->d_align = in_data->d_align;
+                // out_data->d_off = in_data->d_off;
+                if (in_data->d_buf != NULL) {
+                    out_data->d_buf = calloc(in_data->d_size, 1);
+                    memcpy(out_data->d_buf, in_data->d_buf, in_data->d_size);
+                }
+                out_data->d_size = in_data->d_size;
+                out_data->d_version = EV_CURRENT;
+            }
+        }
+
+        Elf64_Shdr *in_shdr = NULL;
+        if ((in_shdr = elf64_getshdr(in_scn)) == NULL) {
+            ERROR("elf64_getshdr in_scn failed\n");
+        }
+
+        Elf64_Shdr *out_shdr = NULL;
+        if ((out_shdr = elf64_getshdr(out_scn)) == NULL) {
+            ERROR("elf64_getshdr out_scn failed\n");
+        }
+
+        out_shdr->sh_name = in_shdr->sh_name;
+        out_shdr->sh_type = in_shdr->sh_type;
+        out_shdr->sh_flags = in_shdr->sh_flags;
+        out_shdr->sh_addr = in_shdr->sh_addr;
+        out_shdr->sh_addralign = 0x8;
+        out_shdr->sh_entsize = in_shdr->sh_entsize;
+        out_shdr->sh_link = in_shdr->sh_link;
+        out_shdr->sh_info = in_shdr->sh_info;
+        out_shdr->sh_size = in_shdr->sh_size;
+    }
 
     size_t shdrstr_idx;
     if (elf_getshdrstrndx(in_elf, &shdrstr_idx) != 0) {
         return STRIPS_SHDR_FAILURE;
     }
 
-    size_t new_shdrstr_size = 0;
-    STRIPS_ERROR_HANDLE(strips_count_stripped_shdrstr_len(
-        in_elf, shdrstr_idx, &new_shdrstr_size, policy));
+    out_ehdr->e_shstrndx = shdrstr_idx;
 
-    char *new_shdrstr = calloc(new_shdrstr_size, sizeof(*new_shdrstr));
-    const size_t new_shdrstr_name = 1;
-    strcpy(new_shdrstr + new_shdrstr_name, ".shdrstr");
-    size_t new_shdrstr_off = new_shdrstr_name + strlen(".shdrstr") + 1;
-
-    Elf_Scn *scn = NULL;
-    while ((scn = elf_nextscn(in_elf, scn)) != NULL) {
-        STRIPS_ERROR_HANDLE(
-            strips_process_section(in_elf, out_elf, scn, shdrstr_idx, policy,
-                                   new_shdrstr, &new_shdrstr_off));
+    if (elf_update(out_elf, ELF_C_NULL) < 0) {
+        fprintf(stderr, "elf_update (nonfinal) failed: %s\n",
+                elf_errmsg(elf_errno()));
+        return STRIPS_FAILURE;
     }
 
-    STRIPS_ERROR_HANDLE(
-        strips_update_shdrstr_section(out_elf, new_shdrstr, new_shdrstr_size,
-                                      new_shdrstr_off, new_shdrstr_name));
+    STRIPS_ERROR_HANDLE(recompute_program_headers(in_elf, out_elf));
 
-    // if (elf_update(out_elf, ELF_C_WRITE) < 0) {
-    //     fprintf(stderr, "elf_update failed: %s\n", elf_errmsg(elf_errno()));
-    //     exit(EXIT_FAILURE);
-    // }
-
-    /* Now recompute PT_LOAD entries to cover SHF_ALLOC sections */
-    size_t phnum = 0;
-    if (elf_getphdrnum(out_elf, &phnum) < 0) {
-        fprintf(stderr, "elf_getphdrnum failed: %s\n", elf_errmsg(elf_errno()));
-        return STRIPS_PHNUM_FAILURE;
-    }
-
-    for (size_t pi = 0; pi < phnum; ++pi) {
-        GElf_Phdr phdr;
-        if (gelf_getphdr(out_elf, pi, &phdr) == NULL) {
-            fprintf(stderr, "gelf_getphdr failed: %s\n",
-                    elf_errmsg(elf_errno()));
-            return STRIPS_PHDR_FAILURE;
-        }
-        // if (phdr.p_type != PT_LOAD)
-        //     continue;
-
-        /* compute new extents */
-        off_t min_off = -1;
-        off_t max_off = 0;
-        Elf_Scn *scn = NULL;
-        while ((scn = elf_nextscn(out_elf, scn)) != NULL) {
-            GElf_Shdr s;
-            if (gelf_getshdr(scn, &s) == NULL)
-                continue;
-            if (!(s.sh_flags & SHF_ALLOC))
-                continue; /* only loadable sections */
-
-            /* Use d_size/sh_size and sh_offset to detect coverage */
-            if (s.sh_offset >= phdr.p_offset &&
-                s.sh_offset < phdr.p_offset + phdr.p_filesz) {
-                off_t scn_start = s.sh_offset;
-                off_t scn_end = (off_t)(s.sh_offset + s.sh_size);
-                if (min_off == -1 || scn_start < min_off)
-                    min_off = scn_start;
-                if (scn_end > max_off)
-                    max_off = scn_end;
-            }
-        }
-
-        if (min_off != -1) {
-            phdr.p_offset = min_off;
-            phdr.p_filesz = (GElf_Word)(max_off - min_off);
-            phdr.p_memsz = phdr.p_filesz;
-            /* Optionally recompute p_vaddr/p_align etc. If sh_addr values are
-               set, choose p_vaddr = min(sh_addr) and p_memsz accordingly. */
-            if (gelf_update_phdr(out_elf, pi, &phdr) == 0) {
-                fprintf(stderr, "gelf_update_phdr failed: %s\n",
-                        elf_errmsg(elf_errno()));
-                return STRIPS_PHDR_FAILURE;
-            }
-        }
-    }
-
-    /* Finally write out with updated PHDRs */
     if (elf_update(out_elf, ELF_C_WRITE) < 0) {
         fprintf(stderr, "elf_update (final) failed: %s\n",
                 elf_errmsg(elf_errno()));
         return STRIPS_FAILURE;
     }
-
-    free(new_shdrstr);
 
     return STRIPS_OK;
 }
@@ -337,7 +796,6 @@ STRIPS_ERROR strips_process_file(const char *filename,
     }
 
     Elf *out_elf = elf_begin(ofd, ELF_C_WRITE, NULL);
-    // elf_flagelf(out_elf, ELF_C_SET, ELF_F_LAYOUT);
     if (out_elf == NULL) {
         ERROR("The file probably exists\n", elf_end(in_elf), close(ifd),
               close(ofd));
