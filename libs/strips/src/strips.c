@@ -1,9 +1,9 @@
 #include <assert.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <gelf.h>
 #include <libelf.h>
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +26,52 @@ static bool strips_should_strip(const char *name, GElf_Shdr *sec_head,
     return remove;
 }
 
+static bool strips_check_magic(Elf *elf) {
+    if (!elf) {
+        return true;
+    }
+
+    GElf_Ehdr ehdr;
+    if (!gelf_getehdr(elf, &ehdr)) {
+        char buf[256];
+        strncpy(buf, elf_errmsg(elf_errno()), 255);
+        ERROR(true, buf);
+    }
+
+    unsigned char *e_ident = ehdr.e_ident;
+    if (e_ident[EI_MAG0] != ELFMAG0 || e_ident[EI_MAG1] != ELFMAG1 ||
+        e_ident[EI_MAG2] != ELFMAG2 || e_ident[EI_MAG3] != ELFMAG3) {
+        ERROR(true, "bad elf magic");
+    }
+
+    if (e_ident[EI_CLASS] != ELFCLASS32 && e_ident[EI_CLASS] != ELFCLASS64) {
+        ERROR(true, "bad elf class");
+    }
+
+    if (e_ident[EI_DATA] != ELFDATA2LSB) {
+        ERROR(true, "bad endianness");
+    }
+
+    if (ehdr.e_ehsize < sizeof(Elf64_Ehdr)) {
+        ERROR(true, "bad elf format");
+    }
+
+    if (ehdr.e_shnum == 0 || ehdr.e_shoff == 0) {
+        ERROR(true, "bad section table");
+    }
+
+    if (ehdr.e_phnum == 0 || ehdr.e_phoff == 0) {
+        ERROR(true, "bad program header table");
+    }
+
+    size_t shstrndx;
+    if (elf_getshdrstrndx(elf, &shstrndx) != 0) {
+        ERROR(true, "bad shstrndx");
+    }
+
+    return false;
+}
+
 STRIPS_ERROR strips_move_sections(Elf *in_elf, const strip_policy_t policy) {
     assert(in_elf);
 
@@ -41,8 +87,10 @@ STRIPS_ERROR strips_move_sections(Elf *in_elf, const strip_policy_t policy) {
             fprintf(stderr, "getshdr failed: %s\n", elf_errmsg(elf_errno()));
             continue;
         }
+
         char *name = elf_strptr(in_elf, shdrstr_idx, shdr.sh_name);
-        if (!strips_should_strip(name, &shdr, policy)) { // skip current shdrstr
+
+        if (!strips_should_strip(name, &shdr, policy)) {
             continue;
         }
 
@@ -54,6 +102,8 @@ STRIPS_ERROR strips_move_sections(Elf *in_elf, const strip_policy_t policy) {
         shdr.sh_size = 0;
 
         if (gelf_update_shdr(scn, &shdr) == 0) {
+            fprintf(stderr, "gelf_update_shdr failed: %s\n",
+                    elf_errmsg(elf_errno()));
             return STRIPS_SHDR_FAILURE;
         }
     }
@@ -64,20 +114,25 @@ STRIPS_ERROR strips_move_sections(Elf *in_elf, const strip_policy_t policy) {
 STRIPS_ERROR strips_process_file(const char *filename,
                                  const strip_policy_t policy) {
     if (elf_version(EV_CURRENT) == EV_NONE) {
-        ERROR("ELF library version mismatch");
+        ERROR(STRIPS_FAILURE, "ELF library version mismatch");
     }
 
     int fd = open(filename, O_RDWR);
     if (fd < 0) {
         perror("Can't open input file decriptor");
-        ERROR("open failed\n");
+        ERROR(STRIPS_FAILURE, "open failed");
     }
 
     Elf *elf = elf_begin(fd, ELF_C_RDWR, NULL);
     if (elf == NULL) {
         perror(elf_errmsg(elf_errno()));
-        ERROR("elf_begin failed\n", close(fd));
+        ERROR(STRIPS_FAILURE, "elf_begin failed", elf_end(elf), close(fd));
     }
+
+    if (strips_check_magic(elf)) {
+        ERROR(STRIPS_FAILURE, "bad elf file", elf_end(elf), close(fd));
+    }
+
     if (elf_flagelf(elf, ELF_C_SET, ELF_F_LAYOUT) == 0) {
         fprintf(stderr, "Failed to set LAYOUT flag for ELF file: %s\n",
                 elf_errmsg(-1));
@@ -87,7 +142,7 @@ STRIPS_ERROR strips_process_file(const char *filename,
     STRIPS_ERROR_HANDLE(strips_move_sections(elf, policy));
 
     if (elf_update(elf, ELF_C_WRITE) < 0) {
-        ERROR("elf_update failed\n", elf_end(elf), close(fd));
+        ERROR(STRIPS_FAILURE, "elf_update failed", elf_end(elf), close(fd));
     }
 
     elf_end(elf);

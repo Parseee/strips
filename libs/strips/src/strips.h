@@ -19,11 +19,12 @@
         }                                                                      \
     } while (0)
 
-#define ERROR(msg, ...)                                                        \
+#define ERROR(failcode, msg, ...)                                              \
     do {                                                                       \
         fprintf(stderr, msg);                                                  \
+        putchar('\n');                                                         \
         __VA_ARGS__;                                                           \
-        return STRIPS_FAILURE;                                                 \
+        return failcode;                                                       \
     } while (0)
 
 typedef enum {
@@ -39,8 +40,6 @@ typedef struct {
     bool symtab;
     bool debug;
 } strip_policy_t;
-
-bool strips_check_magic(Elf32_Ehdr *hdr);
 
 STRIPS_ERROR strips_process_file(const char *filename,
                                  const strip_policy_t policy);
