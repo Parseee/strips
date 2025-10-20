@@ -17,6 +17,7 @@ strip_policy_t manage_options(int argc, char **argv, char **filename) {
         switch (opt) {
         case ('d'): {
             policy.symtab = true;
+            break;
         }
         case ('?'): {
             print_usage();
@@ -24,6 +25,7 @@ strip_policy_t manage_options(int argc, char **argv, char **filename) {
         }
         default: {
             policy.symtab = false;
+            break;
         }
         }
     }

@@ -19,7 +19,7 @@ set(MAIN_SOURCES
     src/main.c)
 
 set(DEPS
-    striptizz)
+    stripzz)
     
 add_executable(${PROJECT_NAME} ${MAIN_SOURCES})
 # add target_link_options

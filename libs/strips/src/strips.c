@@ -33,9 +33,8 @@ static bool strips_check_magic(Elf *elf) {
 
     GElf_Ehdr ehdr;
     if (!gelf_getehdr(elf, &ehdr)) {
-        char buf[256];
-        strncpy(buf, elf_errmsg(elf_errno()), 255);
-        ERROR(true, buf);
+        fprintf(stderr, "%s\n", elf_errmsg(elf_errno()));
+        return true;
     }
 
     unsigned char *e_ident = ehdr.e_ident;
