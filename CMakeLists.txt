@@ -1,29 +1,11 @@
-cmake_minimum_required(VERSION 3.21)
-project(strips C)
+add_shad_executable(strip_executable main.cpp src/strips.cpp src/strips.h)
+target_link_libraries(strip_executable PRIVATE elf)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_shad_executable(tester_strip tester.cpp)
+target_link_libraries(tester_strip PRIVATE elf)
 
-add_library(project_compiler_options INTERFACE)
-target_compile_options(project_compiler_options INTERFACE
-    $<$<CONFIG:Debug>:-Wall -Wextra -fno-omit-frame-pointer -fsanitize=address,leak>
-    $<$<CONFIG:Release>:-O2>
-)
-
-include_directories(src libs)
-
-add_subdirectory(libs/strips)
-
-set(MAIN_SOURCES 
-    src/main.c)
-
-set(DEPS
-    stripzz)
-    
-add_executable(${PROJECT_NAME} ${MAIN_SOURCES})
-# add target_link_options
-target_link_libraries(${PROJECT_NAME} PUBLIC project_compiler_options 
-    $<$<CONFIG:Debug>:-fsanitize=address,leak>  
-    $<$<CONFIG:Release>:-O2>
-    ${DEPS})
+add_shad_tests(test_strip test.cpp)
+target_link_libraries(test_strip PRIVATE elf)
+target_compile_definitions(test_strip PRIVATE STRIP_PATH=\"$<TARGET_FILE:strip_executable>\")
+target_compile_definitions(test_strip PRIVATE TESTER_PATH=\"$<TARGET_FILE:tester_strip>\")
+add_dependencies(test_strip tester_strip)
